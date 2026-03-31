@@ -60,7 +60,7 @@ binarytransparency.log/example+5de0f997+AcPfp2roeTxqSqmPdDkA9rIAd0pe3C5Je6Rze2Sq
 Then, start the log:
 
 ```shell
-go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --purl-type=pypi
+go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --entry-type=purl --purl-type=pypi
 ```
 
 Replace `--purl-type` with the name of the package registry.
@@ -93,7 +93,7 @@ go run ./cmd/witness-server --database-path witness.db --private-key witness-pri
 Then, start the log. The log will verify cosigned checkpoints using the provided witness verification key.
 
 ```shell
-go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --purl-type=pypi --witness-url="http://localhost:8081" --witness-public-key=witness-public.key
+go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --entry-type=purl --purl-type=pypi --witness-url="http://localhost:8081" --witness-public-key=witness-public.key
 ```
 
 The checkpoint in the log's response will contain a co-signed checkpoint:

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ var (
 	host              = flag.String("host", "localhost", "host to listen on")
 	port              = flag.Uint("port", 8080, "port to listen on")
 	storageDir        = flag.String("storage-dir", "", "Root directory to store log data")
+	entryType         = flag.String("entry-type", "", "Specifies the log entry structure. Valid types are [purl, pypi]")
 	purlType          = flag.String("purl-type", "", "Restricts pURLs to be of a specific type")
 	privKeyFile       = flag.String("private-key", "", "Location of private key file")
 	pubKeyFile        = flag.String("public-key", "", "Location of public key file")
@@ -43,8 +45,63 @@ func addCacheHeaders(value string, fs http.Handler) http.HandlerFunc {
 	}
 }
 
-type LogEntry struct {
+type LogEntry interface {
+	Marshal() ([]byte, error)
+	Unmarshal([]byte) error
+}
+
+type PURLLogEntry struct {
 	PURL string `json:"purl"` // e.g. pkg:pypi/pkgname@1.2.3?checksum=sha256:5141b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be92
+	// TODO: Add registry, add filename
+}
+
+func (e PURLLogEntry) Marshal() ([]byte, error) {
+	if e.PURL == "" {
+		return nil, fmt.Errorf("package URL emtpy")
+	}
+	return []byte(e.PURL), nil
+}
+
+func (e *PURLLogEntry) Unmarshal(u []byte) error {
+	e.PURL = string(u)
+	return nil
+}
+
+type PyPILogEntry struct {
+	Filename string `json:"filename"` // e.g. pypi_attestations-0.0.27.tar.gz for source distributions or pypi_attestations-0.0.27-py3-none-any.whl for wheels
+	Checksum string `json:"checksum"` // e.g. sha256:5141b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be92
+	Identity string `json:"identity"` // e.g. https://github.com/octo-org/octo-automation/.github/workflows/oidc.yml@refs/heads/main
+}
+
+func (e PyPILogEntry) Marshal() ([]byte, error) {
+	if e.Filename == "" {
+		return nil, fmt.Errorf("filename empty")
+	}
+	if e.Checksum == "" {
+		return nil, fmt.Errorf("checksum empty")
+	}
+	if e.Identity != "" {
+		return []byte(fmt.Sprintf("%s\n%s\n%s", e.Filename, e.Checksum, e.Identity)), nil
+	} else {
+		return []byte(fmt.Sprintf("%s\n%s", e.Filename, e.Checksum)), nil
+	}
+}
+
+func (e *PyPILogEntry) Unmarshal(u []byte) error {
+	s := strings.Split(string(u), "\n")
+	switch len(s) {
+	case 2:
+		e.Filename = s[0]
+		e.Checksum = s[1]
+		return nil
+	case 3:
+		e.Filename = s[0]
+		e.Checksum = s[1]
+		e.Identity = s[2]
+		return nil
+	default:
+		return fmt.Errorf("incorrect encoding, must contain filename and checksum and optionally identity")
+	}
 }
 
 type LogEntryResponse struct {
@@ -59,7 +116,10 @@ func main() {
 	if *storageDir == "" {
 		log.Fatalf("--storage-dir must be set")
 	}
-	if *purlType == "" {
+	if *entryType != "purl" && *entryType != "pypi" {
+		log.Fatalf("--entry-type must be set to either 'purl' or 'pypi'")
+	}
+	if *entryType == "purl" && *purlType == "" {
 		log.Fatalf("--purl-type must be set")
 	}
 	if *privKeyFile == "" {
@@ -146,19 +206,39 @@ func main() {
 
 		// Parse request
 		var e LogEntry
-		if err := json.Unmarshal(b, &e); err != nil {
+		switch *entryType {
+		case "purl":
+			e = &PURLLogEntry{}
+		case "pypi":
+			e = &PyPILogEntry{}
+		default:
+			// Shouldn't happen as we verify the entry type on server init
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(b, e); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(err.Error()))
 			return
 		}
 
-		if err := purl.VerifyPURL(e.PURL, *purlType); err != nil {
+		if *entryType == "purl" {
+			if err := purl.VerifyPURL(e.(*PURLLogEntry).PURL, *purlType); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(err.Error()))
+				return
+			}
+		}
+		// TODO: Verify PyPI as well - verify filename against regex, verify checksum
+
+		m, err := e.Marshal()
+		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(err.Error()))
 			return
 		}
 
-		f := addFn(r.Context(), tessera.NewEntry([]byte(e.PURL)))
+		f := addFn(r.Context(), tessera.NewEntry(m))
 		idx, rawCp, err := await.Await(ctx, f)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -184,7 +264,7 @@ func main() {
 			return
 		}
 		// make sure the proof is valid
-		leafHash := rfc6962.DefaultHasher.HashLeaf([]byte(e.PURL))
+		leafHash := rfc6962.DefaultHasher.HashLeaf(m)
 		if err := proof.VerifyInclusion(rfc6962.DefaultHasher, idx.Index, cp.Size, leafHash, inclusionProof, cp.Hash); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(err.Error()))

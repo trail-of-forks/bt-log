@@ -43,7 +43,7 @@ jobs:
 
       - name: Run log
         run: |
-          go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --purl-type=pypi --witness-url="http://localhost:8081" --witness-public-key=witness-public.key &
+          go run ./cmd/bt-log --storage-dir=/tmp/bt-log --private-key=private.key --public-key=public.key --entry-type=purl --purl-type=pypi --witness-url="http://localhost:8081" --witness-public-key=witness-public.key &
 
       - name: Verify upload and output
         run: |
