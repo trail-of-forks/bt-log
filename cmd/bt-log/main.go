@@ -72,41 +72,53 @@ func (e *PURLLogEntry) Unmarshal(u []byte) error {
 	return nil
 }
 
+type Publisher struct {
+	Kind    string `json:"kind"`    // e.g. github, gitlab, google
+	Subject string `json:"subject"` // SAN of the certificate used to sign the publish attestation
+}
+
 type PyPILogEntry struct {
-	Filename string `json:"filename"` // e.g. pypi_attestations-0.0.27.tar.gz for source distributions or pypi_attestations-0.0.27-py3-none-any.whl for wheels
-	Checksum string `json:"checksum"` // e.g. sha256:5141b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be92
-	Identity string `json:"identity"` // e.g. https://github.com/octo-org/octo-automation/.github/workflows/oidc.yml@refs/heads/main
+	Checksum  string     `json:"checksum"`            // e.g. sha256:5141b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be92
+	Filename  string     `json:"filename"`            // e.g. urllib3-2.6.3-py3-none-any.whl
+	Publisher *Publisher `json:"publisher,omitempty"` // optional, from PEP 740 publish attestation
 }
 
 func (e PyPILogEntry) Marshal() ([]byte, error) {
-	if e.Filename == "" {
-		return nil, fmt.Errorf("filename empty")
-	}
 	if e.Checksum == "" {
 		return nil, fmt.Errorf("checksum empty")
 	}
-	if e.Identity != "" {
-		return []byte(fmt.Sprintf("%s\n%s\n%s", e.Filename, e.Checksum, e.Identity)), nil
-	} else {
-		return []byte(fmt.Sprintf("%s\n%s", e.Filename, e.Checksum)), nil
+	if e.Filename == "" {
+		return nil, fmt.Errorf("filename empty")
 	}
+	s := fmt.Sprintf("pypi-transparency/v1\n%s\n%s", e.Checksum, e.Filename)
+	if e.Publisher != nil {
+		s += fmt.Sprintf("\npublisher %s %s", e.Publisher.Kind, e.Publisher.Subject)
+	}
+	return []byte(s), nil
 }
 
 func (e *PyPILogEntry) Unmarshal(u []byte) error {
-	s := strings.Split(string(u), "\n")
-	switch len(s) {
-	case 2:
-		e.Filename = s[0]
-		e.Checksum = s[1]
-		return nil
-	case 3:
-		e.Filename = s[0]
-		e.Checksum = s[1]
-		e.Identity = s[2]
-		return nil
-	default:
-		return fmt.Errorf("incorrect encoding, must contain filename and checksum and optionally identity")
+	lines := strings.Split(string(u), "\n")
+	if len(lines) < 3 || len(lines) > 4 {
+		return fmt.Errorf("invalid entry: expected 3 or 4 lines, got %d", len(lines))
 	}
+	if lines[0] != "pypi-transparency/v1" {
+		return fmt.Errorf("invalid entry: unrecognized version %q", lines[0])
+	}
+	e.Checksum = lines[1]
+	e.Filename = lines[2]
+	if len(lines) == 4 {
+		rest, found := strings.CutPrefix(lines[3], "publisher ")
+		if !found {
+			return fmt.Errorf("invalid entry: fourth line must start with \"publisher \"")
+		}
+		kind, subject, found := strings.Cut(rest, " ")
+		if !found {
+			return fmt.Errorf("invalid entry: publisher line must contain kind and subject")
+		}
+		e.Publisher = &Publisher{Kind: kind, Subject: subject}
+	}
+	return nil
 }
 
 type LogEntryResponse struct {
@@ -187,8 +199,8 @@ func main() {
 
 	opts := tessera.NewAppendOptions().
 		WithCheckpointSigner(s).
-		WithCheckpointInterval(5*time.Second).
-		WithBatching(256, time.Second).
+		WithCheckpointInterval(time.Second).
+		WithBatching(1024, 100*time.Millisecond).
 		WithAntispam(256, nil)
 	if witness != nil {
 		opts = opts.WithWitnesses(tessera.NewWitnessGroup(1, witness), &tessera.WitnessOptions{FailOpen: false})
@@ -199,7 +211,7 @@ func main() {
 	}
 	addFn := appender.Add
 	tileFetcher := r.ReadTile
-	await := tessera.NewPublicationAwaiter(ctx, r.ReadCheckpoint, time.Second)
+	await := tessera.NewPublicationAwaiter(ctx, r.ReadCheckpoint, 200*time.Millisecond)
 
 	// Define a handler for /add that accepts POST requests and adds the POST body to the log
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
