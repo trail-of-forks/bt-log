@@ -30,12 +30,17 @@ var (
 	host              = flag.String("host", "localhost", "host to listen on")
 	port              = flag.Uint("port", 8080, "port to listen on")
 	storageDir        = flag.String("storage-dir", "", "Root directory to store log data")
-	entryType         = flag.String("entry-type", "", "Specifies the log entry structure. Valid types are [purl, pypi]")
+	entryType         = flag.String("entry-type", "", "Specifies the log entry structure. Valid types are ["+EntryTypePURL+", "+EntryTypePyPI+"]")
 	purlType          = flag.String("purl-type", "", "Restricts pURLs to be of a specific type")
 	privKeyFile       = flag.String("private-key", "", "Location of private key file")
 	pubKeyFile        = flag.String("public-key", "", "Location of public key file")
 	witnessUrl        = flag.String("witness-url", "", "Optional witness to cosign checkpoint")
 	witnessPubKeyFile = flag.String("witness-public-key", "", "Optional witness public key location to verify cosignatures")
+)
+
+const (
+	EntryTypePURL = "purl"
+	EntryTypePyPI = "pypi"
 )
 
 func addCacheHeaders(value string, fs http.Handler) http.HandlerFunc {
@@ -116,10 +121,10 @@ func main() {
 	if *storageDir == "" {
 		log.Fatalf("--storage-dir must be set")
 	}
-	if *entryType != "purl" && *entryType != "pypi" {
-		log.Fatalf("--entry-type must be set to either 'purl' or 'pypi'")
+	if *entryType != EntryTypePURL && *entryType != EntryTypePyPI {
+		log.Fatalf("--entry-type must be set to either '%s' or '%s'", EntryTypePURL, EntryTypePyPI)
 	}
-	if *entryType == "purl" && *purlType == "" {
+	if *entryType == EntryTypePURL && *purlType == "" {
 		log.Fatalf("--purl-type must be set")
 	}
 	if *privKeyFile == "" {
@@ -207,9 +212,9 @@ func main() {
 		// Parse request
 		var e LogEntry
 		switch *entryType {
-		case "purl":
+		case EntryTypePURL:
 			e = &PURLLogEntry{}
-		case "pypi":
+		case EntryTypePyPI:
 			e = &PyPILogEntry{}
 		default:
 			// Shouldn't happen as we verify the entry type on server init
@@ -222,7 +227,7 @@ func main() {
 			return
 		}
 
-		if *entryType == "purl" {
+		if *entryType == EntryTypePURL {
 			if err := purl.VerifyPURL(e.(*PURLLogEntry).PURL, *purlType); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(err.Error()))
