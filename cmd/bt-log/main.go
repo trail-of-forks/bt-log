@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -79,6 +81,66 @@ type LogEntryResponse struct {
 	Checkpoint     []byte   `json:"checkpoint"`
 	InclusionProof [][]byte `json:"inclusionProof"`
 }
+
+type StatusPageData struct {
+	Origin              string
+	EntryType           string
+	PURLType            string
+	StorageDir          string
+	WitnessConfigured   bool
+	CheckpointAvailable bool
+	TreeSize            uint64
+	RootHash            string
+	RawCheckpoint       string
+	CheckpointError     string
+	GeneratedAt         string
+}
+
+var statusPageTmpl = template.Must(template.New("status").Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bt-log status</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.4; max-width: 900px; }
+    table { border-collapse: collapse; margin: 1rem 0; }
+    th { text-align: left; padding-right: 1.5rem; }
+    th, td { padding-top: 0.35rem; padding-bottom: 0.35rem; vertical-align: top; }
+    code, pre { background: #f6f8fa; border-radius: 6px; }
+    code { padding: 0.1rem 0.3rem; }
+    pre { padding: 1rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>bt-log status</h1>
+  <table>
+    <tr><th>Origin</th><td><code>{{.Origin}}</code></td></tr>
+    <tr><th>Entry type</th><td><code>{{.EntryType}}</code>{{if .PURLType}} / <code>{{.PURLType}}</code>{{end}}</td></tr>
+    <tr><th>Storage directory</th><td><code>{{.StorageDir}}</code></td></tr>
+    <tr><th>Witness</th><td>{{if .WitnessConfigured}}configured{{else}}not configured{{end}}</td></tr>
+    <tr><th>Generated at</th><td>{{.GeneratedAt}}</td></tr>
+  </table>
+
+  <h2>Checkpoint</h2>
+  {{if .CheckpointAvailable}}
+  <table>
+    <tr><th>Tree size</th><td>{{.TreeSize}}</td></tr>
+    <tr><th>Root hash</th><td><code>{{.RootHash}}</code></td></tr>
+  </table>
+  <pre>{{.RawCheckpoint}}</pre>
+  {{else}}
+  <p>No checkpoint is available yet.</p>
+  {{if .CheckpointError}}<p><strong>Error:</strong> <code>{{.CheckpointError}}</code></p>{{end}}
+  {{end}}
+
+  <h2>Links</h2>
+  <ul>
+    <li><a href="/checkpoint">/checkpoint</a></li>
+    <li><a href="/tile/">/tile/</a></li>
+  </ul>
+</body>
+</html>`))
 
 func main() {
 	flag.Parse()
@@ -165,6 +227,44 @@ func main() {
 	addFn := appender.Add
 	tileFetcher := r.ReadTile
 	await := tessera.NewPublicationAwaiter(ctx, r.ReadCheckpoint, 200*time.Millisecond)
+
+	http.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/" {
+			http.NotFound(w, req)
+			return
+		}
+
+		data := StatusPageData{
+			Origin:            v.Name(),
+			EntryType:         *entryType,
+			StorageDir:        *storageDir,
+			WitnessConfigured: witness != nil,
+			GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		}
+		if *entryType == EntryTypePURL {
+			data.PURLType = *purlType
+		}
+
+		rawCp, err := r.ReadCheckpoint(req.Context())
+		if err != nil {
+			data.CheckpointError = err.Error()
+		} else {
+			cp, _, _, err := f_log.ParseCheckpoint(rawCp, v.Name(), v)
+			if err != nil {
+				data.CheckpointError = err.Error()
+			} else {
+				data.CheckpointAvailable = true
+				data.TreeSize = cp.Size
+				data.RootHash = hex.EncodeToString(cp.Hash)
+				data.RawCheckpoint = string(rawCp)
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := statusPageTmpl.Execute(w, data); err != nil {
+			log.Printf("status page: %v", err)
+		}
+	})
 
 	// Define a handler for /add that accepts POST requests and adds the POST body to the log
 	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
