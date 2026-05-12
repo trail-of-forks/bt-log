@@ -36,6 +36,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin, urlparse
 
 import google.auth
+import google.auth.credentials
 import google.auth.transport.requests
 import httpx
 from cryptography import x509
@@ -210,8 +211,8 @@ def set_cursor_values(conn: sqlite3.Connection, values: dict[str, str]):
         )
 
 
-def get_bq_auth() -> tuple[str, str]:
-    """Return (access_token, project_id) from ADC."""
+def get_bq_auth() -> tuple[google.auth.credentials.Credentials, str]:
+    """Return (credentials, project_id) from ADC."""
     scopes = [
         "https://www.googleapis.com/auth/bigquery.readonly",
         "https://www.googleapis.com/auth/cloud-platform.read-only",
@@ -221,15 +222,15 @@ def get_bq_auth() -> tuple[str, str]:
         creds = creds.with_scopes(scopes)
     creds.refresh(google.auth.transport.requests.Request())
     if not project:
-        project = _discover_project(creds.token)
-    return creds.token, project
+        project = _discover_project(creds)
+    return creds, project
 
 
-def _discover_project(token: str) -> str:
+def _discover_project(creds: google.auth.credentials.Credentials) -> str:
     resp = httpx.get(
         "https://cloudresourcemanager.googleapis.com/v1/projects",
         params={"pageSize": 1},
-        headers={"Authorization": f"Bearer {token}"},
+        headers=_bq_headers(creds),
         timeout=10,
     )
     resp.raise_for_status()
@@ -279,18 +280,49 @@ def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _refresh_bq_creds(creds: google.auth.credentials.Credentials, *, force: bool = False):
+    if force or not creds.valid:
+        creds.refresh(google.auth.transport.requests.Request())
+
+
+def _bq_headers(creds: google.auth.credentials.Credentials) -> dict:
+    _refresh_bq_creds(creds)
+    return {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+    }
+
+
 def _bq_request(
+    creds: google.auth.credentials.Credentials,
     method: str,
     url: str,
-    headers: dict,
     json_body: dict | None = None,
     params: dict | None = None,
     max_retries: int = 3,
 ) -> dict:
+    refreshed_after_401 = False
     for attempt in range(max_retries):
         try:
             with httpx.Client(timeout=120) as client:
-                resp = client.request(method, url, headers=headers, json=json_body, params=params)
+                resp = client.request(
+                    method,
+                    url,
+                    headers=_bq_headers(creds),
+                    json=json_body,
+                    params=params,
+                )
+                if resp.status_code == 401 and not refreshed_after_401:
+                    CONSOLE.print("BigQuery returned 401; refreshing Google credentials and retrying...")
+                    _refresh_bq_creds(creds, force=True)
+                    refreshed_after_401 = True
+                    resp = client.request(
+                        method,
+                        url,
+                        headers=_bq_headers(creds),
+                        json=json_body,
+                        params=params,
+                    )
                 resp.raise_for_status()
                 return resp.json()
         except httpx.HTTPError as e:
@@ -323,7 +355,7 @@ def _bigquery_where(
 
 
 def query_bigquery_count(
-    token: str,
+    creds: google.auth.credentials.Credentials,
     project: str,
     last_upload_time: str | None,
     last_filename: str | None,
@@ -335,20 +367,19 @@ def query_bigquery_count(
             FROM `bigquery-public-data.pypi.distribution_metadata`
             {where}
         """
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     data = _bq_request(
+        creds,
         "POST",
         f"{BQ_BASE}/{project}/queries",
-        headers=headers,
         json_body={"query": query, "useLegacySql": False, "maxResults": 1},
     )
     job_id = data["jobReference"]["jobId"]
     while not data.get("jobComplete"):
         time.sleep(2)
         data = _bq_request(
+            creds,
             "GET",
             f"{BQ_BASE}/{project}/queries/{job_id}",
-            headers=headers,
             params={"maxResults": 1},
         )
     rows = data.get("rows", [])
@@ -356,7 +387,7 @@ def query_bigquery_count(
 
 
 def query_bigquery_batch(
-    token: str,
+    creds: google.auth.credentials.Credentials,
     project: str,
     last_upload_time: str | None,
     last_filename: str | None,
@@ -371,17 +402,21 @@ def query_bigquery_batch(
             ORDER BY upload_time ASC, filename ASC, sha256_digest ASC
             LIMIT {batch_size}
         """
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     data = _bq_request(
+        creds,
         "POST",
         f"{BQ_BASE}/{project}/queries",
-        headers=headers,
         json_body={"query": query, "useLegacySql": False, "maxResults": batch_size},
     )
     job_id = data["jobReference"]["jobId"]
     while not data.get("jobComplete"):
         time.sleep(2)
-        data = _bq_request("GET", f"{BQ_BASE}/{project}/queries/{job_id}", headers=headers, params={"maxResults": batch_size})
+        data = _bq_request(
+            creds,
+            "GET",
+            f"{BQ_BASE}/{project}/queries/{job_id}",
+            params={"maxResults": batch_size},
+        )
 
     fields = [f["name"] for f in data["schema"]["fields"]]
     rows: list[RawEntry] = []
@@ -401,9 +436,9 @@ def query_bigquery_batch(
         if not page_token:
             break
         data = _bq_request(
+            creds,
             "GET",
             f"{BQ_BASE}/{project}/queries/{job_id}",
-            headers=headers,
             params={"maxResults": batch_size, "pageToken": page_token},
         )
     return rows
@@ -451,12 +486,12 @@ def run_bigquery(args) -> None:
     else:
         CONSOLE.print("First BigQuery run: fetching all entries")
 
-    token, project = get_bq_auth()
+    creds, project = get_bq_auth()
     CONSOLE.print(f"Using project: {project}")
     progress_total = None
     if not args.no_count:
         CONSOLE.print("Counting remaining BigQuery rows for progress ETA...")
-        progress_total = query_bigquery_count(token, project, last_upload_time, last_filename, last_digest)
+        progress_total = query_bigquery_count(creds, project, last_upload_time, last_filename, last_digest)
         if args.max_rows is not None:
             progress_total = min(progress_total, args.max_rows)
         CONSOLE.print(f"Rows to ingest this run: {progress_total}")
@@ -470,7 +505,7 @@ def run_bigquery(args) -> None:
             if remaining is not None and remaining <= 0:
                 break
             batch_size = min(args.batch_size, remaining) if remaining is not None else args.batch_size
-            rows = query_bigquery_batch(token, project, last_upload_time, last_filename, last_digest, batch_size)
+            rows = query_bigquery_batch(creds, project, last_upload_time, last_filename, last_digest, batch_size)
             if not rows:
                 break
             inserted = insert_raw_entries_and_cursor(conn, rows)
@@ -574,6 +609,25 @@ def _provenance_statuses(retry_failed: bool) -> str:
     return "'unchecked', 'failed'" if retry_failed else "'unchecked'"
 
 
+def mark_pre_provenance_entries_without_provenance(conn: sqlite3.Connection) -> int:
+    """Mark artifacts uploaded before PyPI provenance storage as no-provenance."""
+    cutoff = _since_to_upload_time("2024-08-20T00:00:00Z")
+    now = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            """UPDATE entries
+               SET publisher_kind = NULL,
+                   publisher_subject = NULL,
+                   provenance_status = 'none',
+                   provenance_checked_at = ?,
+                   provenance_error = NULL
+               WHERE provenance_status = 'unchecked'
+                 AND CAST(upload_time AS REAL) < CAST(? AS REAL)""",
+            (now, cutoff),
+        )
+        return conn.execute("SELECT changes()").fetchone()[0]
+
+
 def count_provenance_targets(conn: sqlite3.Connection, retry_failed: bool) -> int:
     statuses = _provenance_statuses(retry_failed)
     row = conn.execute(
@@ -637,6 +691,11 @@ def update_package_provenance(
 
 def run_provenance(args) -> None:
     conn = init_db(args.db)
+    pre_provenance_marked = mark_pre_provenance_entries_without_provenance(conn)
+    if pre_provenance_marked:
+        CONSOLE.print(
+            f"Marked {pre_provenance_marked} entries uploaded before 2024-08-20 as having no provenance"
+        )
     processed = found = none = failed = 0
     start = time.monotonic()
     progress_total = None
